@@ -22,14 +22,13 @@ use crate::tmux::status_detection::{OMP_BANNER_DISMISSAL_ANCHOR, OMP_TERMINAL_RE
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
-    capture_prime_agent_session_id, capture_vibe_session_id, claude_poll_fn,
-    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn,
-    gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn,
-    hermes_poll_fn_sandboxed, is_valid_session_id, kimi_poll_fn, omp_host_routing_environment,
-    omp_poll_fn, omp_poll_fn_sandboxed, omp_sandbox_launch_marker, opencode_poll_fn,
-    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed, prime_agent_poll_fn,
-    reject_omp_secret_args, resolve_omp_store_layout,
+    capture_kimi_session_id, capture_omp_session_id, capture_prime_agent_session_id,
+    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
+    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
+    generate_session_uuid, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
+    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
+    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
+    pi_poll_fn_sandboxed, prime_agent_poll_fn, reject_omp_secret_args, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
@@ -3037,23 +3036,29 @@ impl Instance {
     /// to retroactive capture when no sid is observed, then to a fresh
     /// Claude UUID.
     pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
-        // Only opencode has an opt-in preassign path; deciding it here (rather
-        // than inside acquire_session_id_with) keeps the config read off every
-        // non-opencode launch and keeps the inner fn a pure, testable seam.
+        // Both pre-mint decisions are made here rather than inside
+        // acquire_session_id_with: it keeps the config read and the binary
+        // probe off every other launch, and keeps the inner fn a pure,
+        // testable seam.
         let preassign = self.tool == "opencode" && self.opencode_preassign_enabled();
+        let pin_pi = self.tool == "pi" && self.pi_session_id_pinnable();
         self.acquire_session_id_with(&|path| {
+            if pin_pi {
+                return Some(super::capture::generate_session_uuid());
+            }
             preassign
                 .then(|| super::capture::preassign_opencode_session_id(path))
                 .flatten()
         })
     }
 
-    /// Session-id acquisition with the opencode-preassign step injected as a
-    /// seam, so tests can drive the fresh-launch arms without a real opencode
-    /// binary or network. Production wraps this with the live preassign helper.
+    /// Session-id acquisition with the pre-mint step injected as a seam, so
+    /// tests can drive the fresh-launch arms without a real opencode binary,
+    /// network, or installed pi. Production wraps this with the live preassign
+    /// helper and the Pi pin.
     fn acquire_session_id_with(
         &mut self,
-        preassign_opencode: &dyn Fn(&str) -> Option<String>,
+        mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> (Option<String>, bool) {
         match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
@@ -3063,7 +3068,7 @@ impl Instance {
             ResumeIntent::Cleared => {
                 self.agent_session_id = None;
                 self.resume_probe_failed_sid = None;
-                let session_id = self.fresh_launch_session_id(preassign_opencode);
+                let session_id = self.fresh_launch_session_id(mint_fresh_id);
                 if let Some(ref id) = session_id {
                     self.agent_session_id = Some(id.clone());
                 }
@@ -3146,7 +3151,7 @@ impl Instance {
             }
         }
 
-        let session_id = self.fresh_launch_session_id(preassign_opencode);
+        let session_id = self.fresh_launch_session_id(mint_fresh_id);
 
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
@@ -3157,19 +3162,35 @@ impl Instance {
     }
 
     /// Mint the session id for a brand-new launch. Claude pre-mints a UUID
-    /// (`--session-id`); opencode optionally pre-creates its session through
-    /// the injected preassign seam (opt-in, returns `None` when disabled or on
-    /// failure, deferring to the SQLite poller); every other agent starts
-    /// without a pinned id and is captured post-launch.
+    /// (`--session-id`); Pi pre-mints one too when its binary takes
+    /// `--session-id` (pi 0.76.0+, "creating it if missing"), which is what
+    /// keeps a pane off the shared store's newest-file guess (#3576); opencode
+    /// optionally pre-creates its session through the injected seam (opt-in,
+    /// returns `None` when disabled or on failure, deferring to the SQLite
+    /// poller); every other agent starts without a pinned id and is captured
+    /// post-launch.
     fn fresh_launch_session_id(
         &self,
-        preassign_opencode: &dyn Fn(&str) -> Option<String>,
+        mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
         match self.tool.as_str() {
-            "claude" => Some(generate_claude_session_id()),
-            "opencode" => preassign_opencode(&self.project_path),
+            "claude" => Some(generate_session_uuid()),
+            "opencode" | "pi" => mint_fresh_id(&self.project_path),
             _ => None,
         }
+    }
+
+    /// Whether this session may pin its Pi conversation with `--session-id`.
+    ///
+    /// Requires a binary AoE can vouch for: a command override swaps it for
+    /// one whose flags are unknown, and a sandboxed launch runs the
+    /// container's pi rather than the host binary the probe reads. Both fall
+    /// back to launching unpinned, where the floored poller still attributes
+    /// the conversation pi writes after launch.
+    fn pi_session_id_pinnable(&self) -> bool {
+        !self.has_command_override()
+            && !self.is_sandboxed()
+            && crate::agents::pi_supports_session_id_flag()
     }
 
     /// Whether opt-in opencode session-id preassignment applies to this launch.
@@ -3213,7 +3234,7 @@ impl Instance {
             &self.project_path,
             &self.tool,
             self.tool == "claude"
-                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
+                || (matches!(self.tool.as_str(), "codex" | "kimi" | "pi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
@@ -3289,18 +3310,28 @@ impl Instance {
                 }
             }
             "pi" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_pi_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                    )
-                    .ok()
-                } else {
-                    capture_pi_session_id(&self.project_path, &exclusion).ok()
+                // Host Pi has no retroactive scan. Every host pane either
+                // pinned its conversation with `--session-id` at launch or is
+                // tracked by the floored poller, so the only thing a scan of
+                // `<pi home>/sessions/<encoded-cwd>/` could add here is a
+                // guess: that store is shared by every session on the path and
+                // its newest file names no pane, which is what handed
+                // recovered sessions a co-located peer's conversation (#3576).
+                // The sandboxed store is container-private, so it still scans;
+                // recovery there passes no floor because resuming a session
+                // older than this launch is the point.
+                if !self.is_sandboxed() {
+                    return None;
                 }
+                let exclusion = self.retroactive_capture_exclusion_set();
+                let container_name = self.sandbox_info.as_ref()?.container_name.clone();
+                try_capture_pi_session_id_in_container(
+                    &container_name,
+                    &self.container_workdir(),
+                    &exclusion,
+                    None,
+                )
+                .ok()
             }
             "omp" => {
                 let options = self.omp_capture_options()?;
@@ -3652,7 +3683,7 @@ impl Instance {
                 return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
             }
         }
-        // Kimi: a shared store refuses the MRU scan entirely inside
+        // Kimi and Pi: a shared store refuses the scan entirely inside
         // try_retroactive_capture and surfaces here as None, so a Some from
         // the call below implies the store was sole-owned and the fresher
         // observation attributable. Execution reaches this line for every
@@ -5883,6 +5914,12 @@ impl Instance {
                 }
             }
             "pi" => {
+                // Floored: Pi's store records no pane, so "written after this
+                // pane launched" is what makes an observation this session's
+                // rather than a co-located peer's (#3576). It is also how an
+                // unpinned launch (old binary, command override) still gets
+                // its id, since pi writes the session file at startup.
+                let launch_time_ms = crate::util::now_ms() as f64;
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),
@@ -5892,12 +5929,14 @@ impl Instance {
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        launch_time_ms,
                         extra_excludes.clone(),
                     ))
                 } else {
                     Box::new(pi_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
+                        launch_time_ms,
                         extra_excludes.clone(),
                     ))
                 }
@@ -12043,11 +12082,17 @@ mod tests {
 
     #[test]
     fn test_build_pi_resume_flags() {
+        // An id already on file resumes with `--session`, which every pi
+        // version takes. A fresh launch pins the id AoE minted with
+        // `--session-id`, which creates the session when it is missing.
         let flags = build_resume_flags("pi", "019342ab-1234-7def-8901-abcdef012345", true);
         assert_eq!(flags, "--session 019342ab-1234-7def-8901-abcdef012345");
 
         let flags_new = build_resume_flags("pi", "019342ab-1234-7def-8901-abcdef012345", false);
-        assert_eq!(flags_new, "--session 019342ab-1234-7def-8901-abcdef012345");
+        assert_eq!(
+            flags_new,
+            "--session-id 019342ab-1234-7def-8901-abcdef012345"
+        );
     }
 
     #[test]
@@ -15128,47 +15173,112 @@ mod tests {
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
             }
 
-            #[test]
-            #[serial]
-            fn supersedes_stale_pi_sid() {
-                use crate::session::capture::encode_pi_project_path;
-
-                let temp = tempdir().unwrap();
-                let _home = isolate_app_dir_at(temp.path());
-                let _pi = EnvGuard::set(&[("PI_CODING_AGENT_DIR", temp.path())]);
-
-                let project_dir = temp.path().join("pi-project");
-                fs::create_dir_all(&project_dir).unwrap();
-                let project_path = project_dir.to_string_lossy().to_string();
-
-                let project_session_dir = temp
-                    .path()
-                    .join("sessions")
-                    .join(encode_pi_project_path(&project_path));
-                fs::create_dir_all(&project_session_dir).unwrap();
-
-                let stale = "cccccccc-3333-4333-8333-cccccccccccc";
-                let fresh = "dddddddd-4444-4444-8444-dddddddddddd";
+            /// Seed `<pi_home>/sessions/<encoded cwd>/` with one `.jsonl` per
+            /// sid, the last one newest.
+            fn seed_pi_store(pi_home: &std::path::Path, project_path: &str, sids: &[&str]) {
+                let dir =
+                    pi_home
+                        .join("sessions")
+                        .join(crate::session::capture::encode_pi_project_path(
+                            project_path,
+                        ));
+                fs::create_dir_all(&dir).unwrap();
                 let now = SystemTime::now();
-                for (sid, age) in [(stale, 120), (fresh, 10)] {
-                    let body =
-                        format!(r#"{{"type":"session","id":"{sid}","cwd":"{project_path}"}}"#);
+                for (index, sid) in sids.iter().enumerate() {
+                    let age = 60 * (sids.len() - index) as u64;
                     write_with_mtime(
-                        &project_session_dir.join(format!("20260101T000000_{sid}.jsonl")),
-                        &body,
+                        &dir.join(format!("20260101T000000_{sid}.jsonl")),
+                        &format!(r#"{{"type":"session","id":"{sid}","cwd":"{project_path}"}}"#),
                         now - Duration::from_secs(age),
                     );
                 }
+            }
 
-                let mut inst = Instance::new("verify-pi-bascule", &project_path);
+            // #3576: the store is shared by every session on the project
+            // path and its newest file names no pane, so acquisition must
+            // never consult it. A co-located peer's fresher conversation (the
+            // shape a quit-and-relaunch leaves behind, with no live pane to
+            // publish the peer's sid) must not displace this session's
+            // anchored id.
+            #[test]
+            #[serial]
+            fn pi_acquire_keeps_its_anchor_against_a_fresher_peer_file() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let pi_home = temp.path().join("pi-home");
+                fs::create_dir_all(&pi_home).unwrap();
+                let _pi = EnvGuard::set(&[("PI_CODING_AGENT_DIR", pi_home.to_str().unwrap())]);
+
+                let project = temp.path().join("pi-anchored");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let mine = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
+                let peer = "ffffffff-6666-4666-8666-ffffffffffff";
+                seed_pi_store(&pi_home, &project, &[mine, peer]);
+
+                let mut inst = Instance::new("pi-anchored", &project);
                 inst.tool = "pi".to_string();
-                inst.agent_session_id = Some(stale.to_string());
+                inst.agent_session_id = Some(mine.to_string());
                 inst.resume_intent = ResumeIntent::Default;
 
                 let (sid, is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some(fresh));
+                assert_eq!(sid.as_deref(), Some(mine));
                 assert!(is_existing);
-                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // The same store, entered through the id-less door (recovery of a
+            // session that never captured, and the read-command self-heal):
+            // there is nothing on disk that names this pane, so host Pi
+            // capture declines instead of adopting the newest file.
+            #[test]
+            #[serial]
+            fn pi_id_less_session_never_adopts_a_store_file() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let pi_home = temp.path().join("pi-home");
+                fs::create_dir_all(&pi_home).unwrap();
+                let _pi = EnvGuard::set(&[("PI_CODING_AGENT_DIR", pi_home.to_str().unwrap())]);
+
+                let project = temp.path().join("pi-id-less");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                seed_pi_store(&pi_home, &project, &["pi-older", "pi-newest"]);
+
+                let mut inst = Instance::new("pi-id-less", &project);
+                inst.tool = "pi".to_string();
+
+                assert_eq!(inst.try_retroactive_capture(), None);
+                assert_eq!(inst.agent_session_id, None);
+            }
+
+            // A fresh launch pins the id AoE minted, so the pane's
+            // conversation is known before pi writes anything. An unpinnable
+            // launch (old binary, command override, sandbox) mints nothing and
+            // defers to the floored poller, exactly as it did before pinning.
+            #[test]
+            fn pi_fresh_launch_pins_the_minted_id() {
+                let pinned = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+
+                let mut inst = Instance::new("pi-fresh", "/tmp/pi-fresh");
+                inst.tool = "pi".to_string();
+                let (sid, is_existing) =
+                    inst.acquire_session_id_with(&|_| Some(pinned.to_string()));
+                assert_eq!(sid.as_deref(), Some(pinned));
+                assert!(
+                    !is_existing,
+                    "a pinned launch is a new session, not a resume"
+                );
+                assert_eq!(inst.agent_session_id.as_deref(), Some(pinned));
+                assert_eq!(
+                    super::super::build_resume_flags("pi", pinned, is_existing),
+                    format!("--session-id {pinned}")
+                );
+
+                let mut unpinnable = Instance::new("pi-unpinnable", "/tmp/pi-fresh");
+                unpinnable.tool = "pi".to_string();
+                assert_eq!(unpinnable.acquire_session_id_with(&|_| None), (None, false));
+                assert_eq!(unpinnable.agent_session_id, None);
             }
 
             #[test]
